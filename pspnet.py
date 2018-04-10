@@ -364,88 +364,96 @@ class PSPNet(chainer.Chain):
         else:
             return h
 
-    def prepare(self, img):
-        """Preprocess an image for feature extraction.
-
-        The image is subtracted by a mean image value :obj:`self.mean`.
-
-        Args:
-            img (~numpy.ndarray): An image. This is in CHW and RGB format.
-                The range of its value is :math:`[0, 255]`.
-
-        Returns:
-            ~numpy.ndarray:
-            A preprocessed image.
-
-        """
-        if self.mean is not None:
-            img -= self.mean[:, None, None]
-            img = img.astype(np.float32, copy=False)
-            if self._use_pretrained_model:
-                # Pre-trained model is trained for BGR images
-                img = img[::-1, ...]
-        return img
-
-    def _predict(self, img):
-        img = chainer.Variable(self.xp.asarray(img))
-        with chainer.using_config('train', False):
-            score = self.__call__(img)
-        return chainer.cuda.to_cpu(F.softmax(score).data)
-
-    def _pad_img(self, img):
-        if img.shape[1] < self.input_size[0]:
-            pad_h = self.input_size[0] - img.shape[1]
-            img = np.pad(img, ((0, 0), (0, pad_h), (0, 0)), 'constant')
-        else:
-            pad_h = 0
-        if img.shape[2] < self.input_size[1]:
-            pad_w = self.input_size[1] - img.shape[2]
-            img = np.pad(img, ((0, 0), (0, 0), (0, pad_w)), 'constant')
-        else:
-            pad_w = 0
-        return img, pad_h, pad_w
-
     def _tile_predict(self, img):
+        # Prepare should be made
+        if self.mean is not None:
+            img = img - self.mean[:, None, None]
         ori_rows, ori_cols = img.shape[1:]
         long_size = max(ori_rows, ori_cols)
 
         # When padding input patches is needed
         if long_size > max(self.input_size):
-            count = np.zeros((ori_rows, ori_cols))
-            pred = np.zeros((1, self.n_class, ori_rows, ori_cols))
             stride_rate = 2 / 3.
-            stride = (ceil(self.input_size[0] * stride_rate),
-                      ceil(self.input_size[1] * stride_rate))
-            hh = ceil((ori_rows - self.input_size[0]) / stride[0]) + 1
-            ww = ceil((ori_cols - self.input_size[1]) / stride[1]) + 1
-            for yy in six.moves.xrange(hh):
-                for xx in six.moves.xrange(ww):
-                    sy, sx = yy * stride[0], xx * stride[1]
-                    ey, ex = sy + self.input_size[0], sx + self.input_size[1]
-                    img_sub = img[:, sy:ey, sx:ex]
-                    img_sub, pad_h, pad_w = self._pad_img(img_sub)
+            stride = (int(ceil(self.input_size[0] * stride_rate)),
+                      int(ceil(self.input_size[1] * stride_rate)))
 
-                    # Take average of pred and pred from flipped image
-                    psub1 = self._predict(img_sub[np.newaxis])
-                    psub2 = self._predict(img_sub[np.newaxis, :, :, ::-1])
-                    psub = (psub1 + psub2[:, :, :, ::-1]) / 2.
+            imgs, param = convolution_crop(img, self.input_size, stride, return_param=True)
+            # Horizontal flip
+            # imgs = np.concatenate((imgs, imgs[:, :, :, ::-1]), axis=0)
+            # scores = self._predict(imgs)
 
-                    if sy + self.input_size[0] > ori_rows:
-                        psub = psub[:, :, :-pad_h, :]
-                    if sx + self.input_size[1] > ori_cols:
-                        psub = psub[:, :, :, :-pad_w]
-                    pred[:, :, sy:ey, sx:ex] = psub
-                    count[sy:ey, sx:ex] += 1
-            score = (pred / count[None, None, ...]).astype(np.float32)
+            count = self.xp.zeros((1, ori_rows, ori_cols), dtype=np.float32)
+            pred = self.xp.zeros((1, self.n_class, ori_rows, ori_cols), dtype=np.float32)
+            N = len(param['y_slices'])
+            for i in range(N):
+                print(i)
+                img_i = imgs[i:i+1]
+                y_slice = param['y_slices'][i]
+                x_slice = param['x_slices'][i]
+                crop_y_slice = param['crop_y_slices'][i]
+                crop_x_slice = param['crop_x_slices'][i]
+
+                var = chainer.Variable(self.xp.asarray(img_i))
+                with chainer.using_config('train', False):
+                    scores_i = F.softmax(self.__call__(var)).data
+                assert scores_i.shape[2:] == var.shape[2:]
+                pred[0, :, y_slice, x_slice] += scores_i[0, :, crop_y_slice, crop_x_slice]
+
+                # Horizontal flip
+                flipped_var = chainer.Variable(self.xp.asarray(img_i[:, :, :, ::-1]))
+                with chainer.using_config('train', False):
+                    flipped_scores_i = F.softmax(self.__call__(flipped_var)).data
+                # Flip horizontally flipped score maps again
+                flipped_scores_i = flipped_scores_i[:, :, :, ::-1]
+                pred[0, :, y_slice, x_slice] +=\
+                    flipped_scores_i[0, :, crop_y_slice, crop_x_slice]
+                count[0, y_slice, x_slice] += 2
+
+            # scores[N:] = scores[N:][:, :, :, ::-1]
+
+            # for i in range(N):
+            #     y_slice = param['y_slices'][i]
+            #     x_slice = param['x_slices'][i]
+            #     crop_y_slice = param['crop_y_slices'][i]
+            #     crop_x_slice = param['crop_x_slices'][i]
+
+            #     score_0 = scores[i, :, crop_y_slice, crop_x_slice]
+            #     pred[0, :, y_slice, x_slice] += score_0
+            #     score_1 = scores[N + i, :, crop_y_slice, crop_x_slice]
+            #     pred[0, :, y_slice, x_slice] += score_1
+            #     count[0, y_slice, x_slice] += 2
+            # print('aaaa')
+            # hh = int(ceil((ori_rows - self.input_size[0]) / stride[0])) + 1
+            # ww = int(ceil((ori_cols - self.input_size[1]) / stride[1])) + 1
+            # for yy in six.moves.xrange(hh):
+            #     for xx in six.moves.xrange(ww):
+            #         sy, sx = yy * stride[0], xx * stride[1]
+            #         ey, ex = sy + self.input_size[0], sx + self.input_size[1]
+            #         img_sub = img[:, sy:ey, sx:ex]
+            #         img_sub, pad_h, pad_w = self._pad_img(img_sub)
+
+            #         # Take average of pred and pred from flipped image
+            #         psub1 = self._predict(img_sub[np.newaxis])
+            #         psub2 = self._predict(img_sub[np.newaxis, :, :, ::-1])
+            #         psub = (psub1 + psub2[:, :, :, ::-1]) / 2.
+
+            #         if sy + self.input_size[0] > ori_rows:
+            #             psub = psub[:, :, :-pad_h, :]
+            #         if sx + self.input_size[1] > ori_cols:
+            #             psub = psub[:, :, :, :-pad_w]
+            #         pred[:, :, sy:ey, sx:ex] = psub
+            #         count[sy:ey, sx:ex] += 1
+            score = pred / count[:, None]
         else:
-            img, pad_h, pad_w = self._pad_img(img)
-            pred1 = self._predict(img[np.newaxis])
-            pred2 = self._predict(img[np.newaxis, :, :, ::-1])
-            pred = (pred1 + pred2[:, :, :, ::-1]) / 2.
-            score = pred[
-                :, :, :self.input_size[0] - pad_h, :self.input_size[1] - pad_w]
+            raise ValueError("Not supported\n")
+            # img, pad_h, pad_w = self._pad_img(img)
+            # pred1 = self._predict(img[np.newaxis])
+            # pred2 = self._predict(img[np.newaxis, :, :, ::-1])
+            # pred = (pred1 + pred2[:, :, :, ::-1]) / 2.
+            # score = pred[
+            #     :, :, :self.input_size[0] - pad_h, :self.input_size[1] - pad_w]
         score = F.resize_images(score, (ori_rows, ori_cols))[0].data
-        return score / score.sum(axis=0)
+        return score
 
     def predict(self, imgs, argmax=True):
         """Conduct semantic segmentation from images.
@@ -468,10 +476,8 @@ class PSPNet(chainer.Chain):
         labels = []
         for img in imgs:
             with chainer.using_config('train', False):
-                x = self.prepare(img)
-                score = self._tile_predict(x)
-            label = chainer.cuda.to_cpu(score)
-            if argmax:
-                label = np.argmax(score, axis=0).astype(np.int32)
-            labels.append(label)
+                # x = self.prepare(img)
+                score = self._tile_predict(img)
+            score = chainer.cuda.to_cpu(score)
+            labels.append(np.argmax(score, axis=0).astype(np.int32))
         return labels
