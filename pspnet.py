@@ -10,6 +10,7 @@ import chainer
 import chainer.functions as F
 import chainer.links as L
 from chainercv.utils import download_model
+from chainercv.links.model.pspnet.transforms import convolution_crop
 
 try:
     from chainermn.links import MultiNodeBatchNormalization
@@ -367,7 +368,10 @@ class PSPNet(chainer.Chain):
     def _tile_predict(self, img):
         # Prepare should be made
         if self.mean is not None:
-            img = img - self.mean[:, None, None]
+            img = img - self.mean[:, None, None].astype(np.float32)
+            if self._use_pretrained_model:
+                # pretrained model is trained using BGR images
+                img = img[::-1]
         ori_rows, ori_cols = img.shape[1:]
         long_size = max(ori_rows, ori_cols)
 
